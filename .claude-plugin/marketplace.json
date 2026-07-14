@@ -1,0 +1,15 @@
+{
+  "name": "sms-demo-mik",
+  "owner": {
+    "name": "tushar-fde-ai"
+  },
+  "description": "Michaels SMS campaign performance analysis",
+  "plugins": [
+    {
+      "name": "sms",
+      "source": "./plugins/sms",
+      "description": "Analyze Michaels SMS campaign performance by week",
+      "version": "1.0.0"
+    }
+  ]
+}
