@@ -222,18 +222,19 @@ clicker_crafters AS (
 )
 SELECT
     COUNT(DISTINCT cc.crafter_id) AS customers,
-    COUNT(DISTINCT t.transaction_id) AS transactions,
-    ROUND(SUM(t.trans_total_amt), 2) AS revenue,
-    ROUND(SUM(t.trans_total_amt) / NULLIF(COUNT(DISTINCT t.transaction_id), 0), 2) AS aov,
-    ROUND(SUM(t.trans_total_amt) / NULLIF(COUNT(DISTINCT cc.crafter_id), 0), 2) AS rev_per_clicker
+    COUNT(DISTINCT t.transaction_id_number) AS transactions,
+    ROUND(SUM(t.total_gross_sales), 2) AS revenue,
+    ROUND(SUM(t.total_gross_sales) / NULLIF(COUNT(DISTINCT t.transaction_id_number), 0), 2) AS aov,
+    ROUND(SUM(t.total_gross_sales) / NULLIF(COUNT(DISTINCT cc.crafter_id), 0), 2) AS rev_per_clicker
 FROM clicker_crafters cc
-JOIN cdp_unification_mk.enrich_resa_transaction_head_fact t
+JOIN cdp_unification_mk.enrich_transactions_behaviour t
   ON cc.crafter_id = t.crafter_id
-WHERE t.time BETWEEN cc.first_click_time AND cc.first_click_time + 7*86400
-  AND t.trans_total_amt > 0;
+WHERE t.transaction_time >= '{send_start}'
+  AND t.transaction_time <= CAST(DATE_ADD('day', 7, DATE('{send_start}')) AS VARCHAR)
+  AND t.total_gross_sales > 0;
 ```
 
-> **Attribution:** 7-day post first-click. Identity bridge via `enrich_attentive_optstatus` (opt-in only). Returns excluded (`trans_total_amt > 0`).
+> **Attribution:** 7-day window from send_start. Identity bridge via `enrich_attentive_optstatus` (opt-in only). Returns excluded (`total_gross_sales > 0`).
 
 #### Q3 — Baseline: Similar Send-Size Campaigns (last 90 days)
 ```sql
@@ -283,17 +284,18 @@ peer_revenue AS (
     SELECT
         pc.message_name,
         COUNT(DISTINCT o.crafter_id) AS customers,
-        COUNT(DISTINCT t.transaction_id) AS transactions,
-        ROUND(SUM(t.trans_total_amt), 2) AS revenue
+        COUNT(DISTINCT t.transaction_id_number) AS transactions,
+        ROUND(SUM(t.total_gross_sales), 2) AS revenue
     FROM peer_clickers pc
     JOIN cdp_unification_mk.enrich_attentive_optstatus o
       ON pc.phone = o.phone
      AND o.crafter_id IS NOT NULL AND o.crafter_id <> ''
      AND o.opt_in_status = 'join'
-    JOIN cdp_unification_mk.enrich_resa_transaction_head_fact t
+    JOIN cdp_unification_mk.enrich_transactions_behaviour t
       ON o.crafter_id = t.crafter_id
-     AND t.time BETWEEN pc.first_click_time AND pc.first_click_time + 7*86400
-     AND t.trans_total_amt > 0
+     AND t.transaction_time >= CAST(DATE_FORMAT(FROM_UNIXTIME(pc.first_click_time), '%Y-%m-%d') AS VARCHAR)
+     AND t.transaction_time <= CAST(DATE_ADD('day', 7, DATE(DATE_FORMAT(FROM_UNIXTIME(pc.first_click_time), '%Y-%m-%d'))) AS VARCHAR)
+     AND t.total_gross_sales > 0
     GROUP BY 1
 )
 SELECT
@@ -351,5 +353,5 @@ Show peer count below the table (e.g. "Baseline: 8 similar campaigns in last 90 
 | `mk_src.attentive_general_histunion` | Raw SMS events — sends, clicks. Filter on `message_name` + `type`. |
 | `mk_src.attentive_optstatus` | Subscriber opt-in status. Use for subscriber count. |
 | `cdp_unification_mk.enrich_attentive_optstatus` | Phone → `crafter_id` bridge. Use `opt_in_status = 'join'` only. |
-| `cdp_unification_mk.enrich_resa_transaction_head_fact` | Transaction header. `crafter_id`, `time` (Unix epoch), `trans_total_amt`, `transaction_id`. |
+| `cdp_unification_mk.enrich_transactions_behaviour` | Transactions. Has `crafter_id`, `transaction_time` (string), `total_gross_sales`, `transaction_id_number`. |
 | `cdp_unification_mk.bq_date_dim` | Calendar / fiscal week dimension. |
