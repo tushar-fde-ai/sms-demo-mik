@@ -266,9 +266,23 @@ Store the peer campaign names from the `peers` CTE — needed for Q3b.
 
 ---
 
-### Step B4: Render initial dashboard, then run Phase 2 in parallel
+### Step B4: Present Phase 1 results immediately as text
 
-Once Q1, Q2a, Q3a complete, render the dashboard with engagement metrics and click rate baseline. Then immediately kick off Q2b and Q3b in parallel — these are the heavy transaction scans.
+As soon as Q1, Q2a, and Q3a complete, output a text summary — do not wait for Phase 2:
+
+> **{input_campaign}** — sent {send_date}
+>
+> | Metric | Value |
+> |--------|-------|
+> | Sends | {total_sends} |
+> | Unique Clickers | {unique_clickers} |
+> | Click Rate | {click_rate_pct}% |
+>
+> Baseline click rate (median, {peer_campaign_count} similar campaigns): **{median_click_rate_pct}%** ({delta} bps vs baseline)
+>
+> Running revenue attribution now...
+
+Then immediately kick off Q2b and Q3b in parallel.
 
 #### Q2b — Click-Attributed Revenue (uses crafter_ids from Q2a)
 
@@ -334,9 +348,7 @@ FROM peer_txn_agg;
 
 ---
 
-### Step B5: Update dashboard with revenue data
-
-Once Q2b and Q3b complete, update the dashboard tiles and baseline table with revenue metrics.
+### Step B5: Render full dashboard once Q2b and Q3b complete
 
 **KPI row (5 tiles):** Sends · Unique Clickers · Click Rate · Revenue (7-day click-attributed) · AOV
 
