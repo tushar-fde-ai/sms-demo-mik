@@ -178,7 +178,9 @@ WHERE message_name = '{input_campaign}'
 
 Store `send_start` and `send_end`. Attribution window: `send_start` to `send_start + 7 days`.
 
-### Step B3: Run all queries in parallel
+### Step B3: Run Phase 1 queries in parallel (fast — engagement + click baseline)
+
+Run Q1, Q2a, and Q3a together. These hit only the SMS event table and the opt-status bridge — no transaction scans.
 
 #### Q1 — Campaign Engagement Metrics
 ```sql
@@ -202,45 +204,28 @@ SELECT
 FROM campaign_raw;
 ```
 
-#### Q2 — Click-Attributed Revenue (7-day window)
+#### Q2a — Resolve Clicker Crafter IDs (fast — SMS tables only)
+
+Run this first. Returns a small set (~thousands of rows) used as the predicate for Q2b.
+
 ```sql
-WITH clickers AS (
-    SELECT phone, MIN(CAST(time AS BIGINT)) AS first_click_time
-    FROM mk_src.attentive_general_histunion
-    WHERE message_name = '{input_campaign}'
-      AND type = 'MESSAGE_LINK_CLICK'
-      AND substring(timestamp,1,10) BETWEEN '{send_start}' AND '{send_end}'
-    GROUP BY 1
-),
-clicker_crafters AS (
-    SELECT DISTINCT c.phone, c.first_click_time, o.crafter_id
-    FROM clickers c
-    JOIN cdp_unification_mk.enrich_attentive_optstatus o
-      ON c.phone = o.phone
-    WHERE o.crafter_id IS NOT NULL AND o.crafter_id <> ''
-      AND o.opt_in_status = 'join'
-)
-SELECT
-    COUNT(DISTINCT cc.crafter_id) AS customers,
-    COUNT(DISTINCT t.transaction_id_number) AS transactions,
-    ROUND(SUM(t.total_gross_sales), 2) AS revenue,
-    ROUND(SUM(t.total_gross_sales) / NULLIF(COUNT(DISTINCT t.transaction_id_number), 0), 2) AS aov,
-    ROUND(SUM(t.total_gross_sales) / NULLIF(COUNT(DISTINCT cc.crafter_id), 0), 2) AS rev_per_clicker
-FROM clicker_crafters cc
-JOIN cdp_unification_mk.enrich_transactions_behaviour t
-  ON cc.crafter_id = t.crafter_id
-WHERE t.transaction_time >= '{send_start}'
-  AND t.transaction_time <= CAST(DATE_ADD('day', 7, DATE('{send_start}')) AS VARCHAR)
-  AND t.total_gross_sales > 0;
+SELECT DISTINCT o.crafter_id
+FROM mk_src.attentive_general_histunion a
+JOIN cdp_unification_mk.enrich_attentive_optstatus o
+  ON a.phone = o.phone
+WHERE a.message_name = '{input_campaign}'
+  AND a.type = 'MESSAGE_LINK_CLICK'
+  AND a.substring(timestamp,1,10) BETWEEN '{send_start}' AND '{send_end}'
+  AND o.crafter_id IS NOT NULL AND o.crafter_id <> ''
+  AND o.opt_in_status = 'join';
 ```
 
-> **Attribution:** 7-day window from send_start. Identity bridge via `enrich_attentive_optstatus` (opt-in only). Returns excluded (`total_gross_sales > 0`).
+Store the result as `{clicker_crafter_ids}` — a list of crafter_ids to pass into Q2b.
 
-#### Q3 — Baseline: Similar Send-Size Campaigns (last 90 days)
+#### Q3a — Baseline Click Rate (fast — SMS tables only)
 ```sql
 WITH this_campaign AS (
-    SELECT
-        COUNT(DISTINCT CASE WHEN type = 'MESSAGE_RECEIPT' THEN phone END) AS this_sends
+    SELECT COUNT(DISTINCT CASE WHEN type = 'MESSAGE_RECEIPT' THEN phone END) AS this_sends
     FROM mk_src.attentive_general_histunion
     WHERE message_name = '{input_campaign}'
       AND type IN ('MESSAGE_RECEIPT','MESSAGE_LINK_CLICK')
@@ -269,58 +254,93 @@ peers AS (
     CROSS JOIN this_campaign tc
     WHERE ps.sends BETWEEN tc.this_sends * 0.7 AND tc.this_sends * 1.3
       AND ps.sends > 0
-),
-peer_clickers AS (
+)
+SELECT
+    COUNT(*) AS peer_campaign_count,
+    APPROX_PERCENTILE(ROUND(100.0 * clicks / NULLIF(sends, 0), 2), 0.5) AS median_click_rate_pct,
+    AVG(ROUND(100.0 * clicks / NULLIF(sends, 0), 2)) AS avg_click_rate_pct
+FROM peers;
+```
+
+Store the peer campaign names from the `peers` CTE — needed for Q3b.
+
+---
+
+### Step B4: Render initial dashboard, then run Phase 2 in parallel
+
+Once Q1, Q2a, Q3a complete, render the dashboard with engagement metrics and click rate baseline. Then immediately kick off Q2b and Q3b in parallel — these are the heavy transaction scans.
+
+#### Q2b — Click-Attributed Revenue (uses crafter_ids from Q2a)
+
+Scans `enrich_transactions_behaviour` filtered to the resolved crafter_id set — much smaller join surface than a full table scan.
+
+```sql
+SELECT
+    COUNT(DISTINCT t.crafter_id) AS customers,
+    COUNT(DISTINCT t.transaction_id_number) AS transactions,
+    ROUND(SUM(t.total_gross_sales), 2) AS revenue,
+    ROUND(SUM(t.total_gross_sales) / NULLIF(COUNT(DISTINCT t.transaction_id_number), 0), 2) AS aov,
+    ROUND(SUM(t.total_gross_sales) / NULLIF(COUNT(DISTINCT t.crafter_id), 0), 2) AS rev_per_clicker
+FROM cdp_unification_mk.enrich_transactions_behaviour t
+WHERE t.crafter_id IN ({clicker_crafter_ids})
+  AND t.transaction_time >= '{send_start}'
+  AND t.transaction_time <= CAST(DATE_ADD('day', 7, DATE('{send_start}')) AS VARCHAR)
+  AND t.total_gross_sales > 0;
+```
+
+> **Attribution:** 7-day window from send_start. Returns excluded (`total_gross_sales > 0`).
+
+#### Q3b — Baseline Revenue (uses peer campaign names from Q3a)
+
+Resolves peer clicker crafter_ids then attributes transactions. Scoped to only the peer campaigns identified in Q3a.
+
+```sql
+WITH peer_clickers AS (
     SELECT
         a.message_name,
-        a.phone,
-        MIN(CAST(a.time AS BIGINT)) AS first_click_time
+        o.crafter_id,
+        MIN(substring(a.timestamp,1,10)) AS send_date
     FROM mk_src.attentive_general_histunion a
-    JOIN peers p ON a.message_name = p.message_name
-    WHERE a.type = 'MESSAGE_LINK_CLICK'
+    JOIN cdp_unification_mk.enrich_attentive_optstatus o
+      ON a.phone = o.phone
+    WHERE a.message_name IN ({peer_campaign_names})
+      AND a.type = 'MESSAGE_LINK_CLICK'
+      AND o.crafter_id IS NOT NULL AND o.crafter_id <> ''
+      AND o.opt_in_status = 'join'
     GROUP BY 1, 2
 ),
-peer_revenue AS (
+peer_txn_agg AS (
     SELECT
         pc.message_name,
-        COUNT(DISTINCT o.crafter_id) AS customers,
         COUNT(DISTINCT t.transaction_id_number) AS transactions,
+        COUNT(DISTINCT pc.crafter_id) AS customers,
         ROUND(SUM(t.total_gross_sales), 2) AS revenue
     FROM peer_clickers pc
-    JOIN cdp_unification_mk.enrich_attentive_optstatus o
-      ON pc.phone = o.phone
-     AND o.crafter_id IS NOT NULL AND o.crafter_id <> ''
-     AND o.opt_in_status = 'join'
     JOIN cdp_unification_mk.enrich_transactions_behaviour t
-      ON o.crafter_id = t.crafter_id
-     AND t.transaction_time >= CAST(DATE_FORMAT(FROM_UNIXTIME(pc.first_click_time), '%Y-%m-%d') AS VARCHAR)
-     AND t.transaction_time <= CAST(DATE_ADD('day', 7, DATE(DATE_FORMAT(FROM_UNIXTIME(pc.first_click_time), '%Y-%m-%d'))) AS VARCHAR)
+      ON pc.crafter_id = t.crafter_id
+     AND t.transaction_time >= pc.send_date
+     AND t.transaction_time <= CAST(DATE_ADD('day', 7, DATE(pc.send_date)) AS VARCHAR)
      AND t.total_gross_sales > 0
     GROUP BY 1
 )
 SELECT
-    COUNT(DISTINCT p.message_name) AS peer_campaign_count,
-    APPROX_PERCENTILE(ROUND(100.0 * p.clicks / NULLIF(p.sends,0), 2), 0.5) AS median_click_rate_pct,
-    AVG(ROUND(100.0 * p.clicks / NULLIF(p.sends,0), 2)) AS avg_click_rate_pct,
-    APPROX_PERCENTILE(COALESCE(pr.revenue, 0), 0.5) AS median_revenue,
-    AVG(COALESCE(pr.revenue, 0)) AS avg_revenue,
-    APPROX_PERCENTILE(ROUND(COALESCE(pr.revenue,0) / NULLIF(COALESCE(pr.customers,0),0), 2), 0.5) AS median_rev_per_clicker,
-    APPROX_PERCENTILE(ROUND(COALESCE(pr.revenue,0) / NULLIF(COALESCE(pr.transactions,0),0), 2), 0.5) AS median_aov
-FROM peers p
-LEFT JOIN peer_revenue pr ON p.message_name = pr.message_name;
+    COUNT(*) AS peer_campaign_count,
+    APPROX_PERCENTILE(COALESCE(revenue, 0), 0.5) AS median_revenue,
+    AVG(COALESCE(revenue, 0)) AS avg_revenue,
+    APPROX_PERCENTILE(ROUND(COALESCE(revenue,0) / NULLIF(COALESCE(customers,0),0), 2), 0.5) AS median_rev_per_clicker,
+    APPROX_PERCENTILE(ROUND(COALESCE(revenue,0) / NULLIF(COALESCE(transactions,0),0), 2), 0.5) AS median_aov
+FROM peer_txn_agg;
 ```
 
-> **Peer logic:** Mass/Promo campaigns, last 90 days, ±30% send volume. Same 7-day attribution applied to each peer.
+---
 
-### Step B4: Dashboard Output
+### Step B5: Update dashboard with revenue data
 
-Render a self-contained HTML dashboard.
-
-**Header:** "SMS Campaign Analysis — {input_campaign}" with send date below.
+Once Q2b and Q3b complete, update the dashboard tiles and baseline table with revenue metrics.
 
 **KPI row (5 tiles):** Sends · Unique Clickers · Click Rate · Revenue (7-day click-attributed) · AOV
 
-**Overview + Baseline comparison table:**
+**Baseline comparison table:**
 
 | Metric | This Campaign | Baseline Median | vs Baseline |
 |--------|---------------|-----------------|-------------|
@@ -329,7 +349,7 @@ Render a self-contained HTML dashboard.
 | Rev / Clicker | $x | $x | +/- % |
 | AOV | $x | $x | +/- % |
 
-Show peer count below the table (e.g. "Baseline: 8 similar campaigns in last 90 days").
+Show peer count (e.g. "Baseline: 8 similar campaigns in last 90 days").
 
 **Design:** Professional, clean, minimal. Neutral palette. Inline CSS — no external dependencies.
 
