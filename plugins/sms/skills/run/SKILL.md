@@ -103,7 +103,7 @@ ORDER BY segment;
 ### Q2 — Subscriber Count (as of this week)
 ```sql
 SELECT COUNT(DISTINCT a.phone) AS total_subscribers
-FROM mk_src.attentive_optstatus_histunion a
+FROM mk_src.attentive_optstatus a
 JOIN mk_src.bq_date_dim b ON substring(a.timestamp,1,10) = b.day_dt
 WHERE CAST(b.wk_idnt AS INT) <= CAST('{input_week}' AS INT)
   AND opt_in_status = 'JOIN';
