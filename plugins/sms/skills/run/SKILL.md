@@ -352,6 +352,81 @@ FROM peer_txn_agg;
 
 **KPI row (5 tiles):** Sends · Unique Clickers · Click Rate · Revenue (7-day click-attributed) · AOV
 
+**Tabs: Overview · Departments · Baseline**
+
+Then ask:
+
+> "Dashboard ready. Would you like to add **RFM Segments**? This breaks down clicker performance by Core / Aspiring / Developing / Uncommitted segments. Requires 2 additional queries against the transaction history table — typically takes 10-20 minutes."
+
+---
+
+### Step B6 (optional — on user request): RFM + Department breakdown
+
+Run Q4 and Q5 in parallel.
+
+#### Q4 — Department Attribution (uses crafter_ids from Q2a)
+
+Pre-aggregate transactions per crafter first, then join to departments. `GROUPING(dept_name) = 1` rows are campaign totals, `= 0` are department rows.
+
+```sql
+SELECT
+    t.dept_name,
+    GROUPING(t.dept_name) AS is_total,
+    COUNT(DISTINCT t.transaction_id_number) AS transactions,
+    COUNT(DISTINCT t.crafter_id) AS customers,
+    SUM(t.item_quantity) AS quantity,
+    ROUND(SUM(t.total_gross_sales), 2) AS revenue
+FROM cdp_unification_mk.enrich_transactions_behaviour t
+WHERE t.crafter_id IN ({clicker_crafter_ids})
+  AND t.transaction_time >= '{send_start}'
+  AND t.transaction_time <= CAST(DATE_ADD('day', 7, DATE('{send_start}')) AS VARCHAR)
+  AND t.total_gross_sales > 0
+GROUP BY GROUPING SETS ((t.dept_name), ())
+ORDER BY is_total DESC, revenue DESC;
+```
+
+> Dept revenue rows sum > campaign total — expected (multi-dept baskets). Display `is_total = 1` row as the campaign total header, `is_total = 0` rows as the department table. Ignore rows where `dept_name IS NULL AND is_total = 0`.
+
+#### Q5 — RFM Segment Attribution (uses crafter_ids from Q2a)
+
+Pre-aggregate transactions per crafter first, then join to RFM master. No email bridge needed — crafter_ids are already resolved.
+
+```sql
+WITH clicker_txn_agg AS (
+    SELECT
+        t.crafter_id,
+        COUNT(DISTINCT t.transaction_id_number) AS purchases,
+        ROUND(SUM(t.total_gross_sales), 2) AS revenue
+    FROM cdp_unification_mk.enrich_transactions_behaviour t
+    WHERE t.crafter_id IN ({clicker_crafter_ids})
+      AND t.transaction_time >= '{send_start}'
+      AND t.transaction_time <= CAST(DATE_ADD('day', 7, DATE('{send_start}')) AS VARCHAR)
+      AND t.total_gross_sales > 0
+    GROUP BY t.crafter_id
+)
+SELECT
+    cust.rfm_segment_week AS rfm_segment,
+    COUNT(DISTINCT cta.crafter_id) AS clickers,
+    COUNT(DISTINCT CASE WHEN cta.purchases > 0 THEN cta.crafter_id END) AS customers,
+    SUM(COALESCE(cta.purchases, 0)) AS transactions,
+    ROUND(SUM(COALESCE(cta.revenue, 0)), 2) AS revenue,
+    ROUND(100.0 * COUNT(DISTINCT CASE WHEN cta.purchases > 0 THEN cta.crafter_id END)
+        / NULLIF(COUNT(DISTINCT cta.crafter_id), 0), 2) AS conv_rate_pct,
+    ROUND(SUM(COALESCE(cta.revenue, 0)) / NULLIF(COUNT(DISTINCT cta.crafter_id), 0), 2) AS rev_per_clicker,
+    ROUND(SUM(COALESCE(cta.revenue, 0)) / NULLIF(SUM(COALESCE(cta.purchases, 0)), 0), 2) AS aov
+FROM clicker_txn_agg cta
+JOIN cdp_audience_961573.customers cust ON cust.crafter_id = cta.crafter_id
+WHERE cust.rfm_segment_week IS NOT NULL
+GROUP BY cust.rfm_segment_week
+ORDER BY revenue DESC;
+```
+
+> **RFM segments:** Core · Aspiring · Developing · Uncommitted. `clickers` = all SMS clickers in that segment (buyers + non-buyers). `customers` = those who also transacted within the 7-day window.
+
+### Step B7: Re-render dashboard with RFM + Departments tabs added
+
+Full dashboard: **Overview · Departments · RFM Segments · Baseline**
+
 **Baseline comparison table:**
 
 | Metric | This Campaign | Baseline Median | vs Baseline |
